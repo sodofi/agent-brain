@@ -1,0 +1,18 @@
+# Private config (contains bot token, API keys, vault path)
+config.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+
+# Logs
+bot.log
