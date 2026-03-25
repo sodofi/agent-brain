@@ -20,7 +20,7 @@ Links get fetched and content extracted. Text gets saved as-is. Everything is ti
 - **Important:** Send `/setprivacy` → select your bot → Disable (so the bot can read group messages)
 
 ### 2. Add the bot to your group
-- Open your "Brain" group chat
+- Create a "BRAIN" group chat
 - Add the bot as a member
 - Make sure the group has Topics enabled (Group Settings → Topics)
 
@@ -86,4 +86,3 @@ nohup python bot.py &
 # macOS: create a Launch Agent (runs on login)
 # See Apple docs for ~/Library/LaunchAgents/ plist format
 ```
-# agent-brain

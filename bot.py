@@ -13,10 +13,15 @@ Setup:
 """
 
 import re
+import os
+import json
 import asyncio
 import logging
+import tempfile
+import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, List, Dict
 from urllib.parse import urlparse
 
 import httpx
@@ -80,10 +85,10 @@ HEADERS = {
 }
 
 # Build a lookup from lowercased topic name → file path
-_TOPIC_LOOKUP: dict[str, str] = {k.lower(): v for k, v in TOPIC_TO_FILE.items()}
+_TOPIC_LOOKUP: Dict[str, str] = {k.lower(): v for k, v in TOPIC_TO_FILE.items()}
 
 
-def get_file_for_topic(topic_name: str | None) -> Path:
+def get_file_for_topic(topic_name: Optional[str]) -> Path:
     """Given a forum topic name, return the Obsidian file path."""
     if topic_name:
         match = _TOPIC_LOOKUP.get(topic_name.strip().lower())
@@ -108,6 +113,8 @@ def classify_url(url: str) -> str:
         return "twitter"
     if "instagram.com" in domain:
         return "instagram"
+    if "tiktok.com" in domain:
+        return "tiktok"
     if "youtube.com" in domain or "youtu.be" in domain:
         return "youtube"
     if "reddit.com" in domain:
@@ -123,15 +130,197 @@ def classify_url(url: str) -> str:
     return "article"
 
 
+async def transcribe_video(url: str) -> Dict[str, Optional[str]]:
+    """Download audio from a video URL, get caption, and transcribe with Whisper."""
+    result = {"transcript": None, "caption": None}
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = os.path.join(tmpdir, "audio.m4a")
+
+            # Step 1: Get caption/description via yt-dlp
+            cap_proc = await asyncio.create_subprocess_exec(
+                "yt-dlp",
+                "--no-playlist",
+                "--skip-download",
+                "--print", "%(description)s",
+                "--quiet",
+                url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            cap_out, _ = await asyncio.wait_for(cap_proc.communicate(), timeout=30)
+            caption = cap_out.decode().strip() if cap_proc.returncode == 0 else ""
+            if caption and caption != "NA":
+                result["caption"] = caption
+
+            # Step 2: Download audio with yt-dlp
+            proc = await asyncio.create_subprocess_exec(
+                "yt-dlp",
+                "--no-playlist",
+                "-x", "--audio-format", "m4a",
+                "-o", audio_path,
+                "--quiet",
+                url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            if proc.returncode != 0:
+                log.warning(f"yt-dlp failed for {url}: {stderr.decode()}")
+                return result
+
+            # yt-dlp may add extensions, find the actual file
+            actual = None
+            for f in os.listdir(tmpdir):
+                if f.startswith("audio"):
+                    actual = os.path.join(tmpdir, f)
+                    break
+            if not actual or not os.path.exists(actual):
+                log.warning(f"No audio file found after yt-dlp for {url}")
+                return result
+
+            # Step 3: Transcribe with Whisper
+            import whisper
+            model = whisper.load_model("base")
+            w_result = await asyncio.to_thread(model.transcribe, actual)
+            text = w_result.get("text", "").strip()
+
+            if text:
+                if len(text) > 3000:
+                    cut = text[:3000].rfind(".")
+                    if cut > 1000:
+                        text = text[: cut + 1] + "\n\n[...truncated]"
+                    else:
+                        text = text[:3000] + "\n\n[...truncated]"
+                result["transcript"] = text
+
+    except Exception as e:
+        log.warning(f"Video transcription failed for {url}: {e}")
+
+    return result
+
+
 async def fetch_and_extract(url: str) -> dict:
     """Fetch a URL and extract the useful bits."""
     source_type = classify_url(url)
     result = {"url": url, "source_type": source_type, "title": "", "content": "", "error": None}
 
-    hard_to_scrape = source_type in ("instagram",)
-    if hard_to_scrape:
-        result["title"] = f"{source_type.title()} post"
-        result["content"] = f"[Open link to view]({url})"
+    # Twitter/X: use GraphQL API with guest token for full tweet text
+    if source_type == "twitter":
+        try:
+            tweet_id = re.search(r"/status/(\d+)", url)
+            if not tweet_id:
+                result["error"] = "Could not parse tweet ID"
+                return result
+            tid = tweet_id.group(1)
+
+            async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
+                bearer = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+
+                # Get guest token
+                token_resp = await client.post(
+                    "https://api.twitter.com/1.1/guest/activate.json",
+                    headers={"Authorization": f"Bearer {bearer}"},
+                    content="",
+                )
+                token_resp.raise_for_status()
+                guest_token = token_resp.json()["guest_token"]
+
+                # Fetch full tweet via GraphQL
+                variables = json.dumps({"tweetId": tid, "withCommunity": False, "includePromotedContent": False, "withVoice": False})
+                features = json.dumps({
+                    "longform_notetweets_consumption_enabled": True,
+                    "longform_notetweets_rich_text_read_enabled": True,
+                    "longform_notetweets_inline_media_enabled": True,
+                    "responsive_web_graphql_exclude_directive_enabled": True,
+                    "verified_phone_label_enabled": False,
+                    "responsive_web_graphql_timeline_navigation_enabled": True,
+                    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+                    "responsive_web_enhance_cards_enabled": False,
+                    "creator_subscriptions_tweet_preview_api_enabled": True,
+                    "communities_web_enable_tweet_community_results_fetch": True,
+                    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+                    "articles_preview_enabled": True,
+                    "responsive_web_edit_tweet_api_enabled": True,
+                    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+                    "view_counts_everywhere_api_enabled": True,
+                    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+                    "tweet_awards_web_tipping_enabled": False,
+                    "creator_subscriptions_quote_tweet_preview_enabled": False,
+                    "freedom_of_speech_not_reach_fetch_enabled": True,
+                    "standardized_nudges_misinfo": True,
+                    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+                    "rweb_video_timestamps_enabled": True,
+                })
+                resp = await client.get(
+                    "https://api.twitter.com/graphql/Xl5pC_lBk_gcO2ItU39DQw/TweetResultByRestId",
+                    params={"variables": variables, "features": features},
+                    headers={
+                        "Authorization": f"Bearer {bearer}",
+                        "x-guest-token": guest_token,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            tweet_data = data["data"]["tweetResult"]["result"]
+            legacy = tweet_data.get("legacy", {})
+            core = tweet_data.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
+            author = core.get("name", "unknown")
+            handle = core.get("screen_name", "")
+            result["title"] = f"X post by {author} (@{handle})"
+
+            # Prefer note_tweet (long-form) over legacy full_text
+            note = tweet_data.get("note_tweet", {}).get("note_tweet_results", {}).get("result", {})
+            tweet_text = note.get("text") or legacy.get("full_text", "")
+
+            parts = [tweet_text] if tweet_text else []
+
+            # Include quoted tweet if present
+            quoted = tweet_data.get("quoted_status_result", {}).get("result", {})
+            if quoted:
+                q_legacy = quoted.get("legacy", {})
+                q_core = quoted.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
+                q_note = quoted.get("note_tweet", {}).get("note_tweet_results", {}).get("result", {})
+                q_text = q_note.get("text") or q_legacy.get("full_text", "")
+                q_handle = q_core.get("screen_name", "")
+                if q_text:
+                    parts.append(f"\n> Quoting @{q_handle}:\n> {q_text}")
+
+            result["content"] = "\n".join(parts).strip()
+
+        except Exception as e:
+            log.warning(f"Twitter GraphQL failed for {url}: {e}")
+            # Fallback to syndication API
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        "https://cdn.syndication.twimg.com/tweet-result",
+                        params={"id": tid, "token": "0"},
+                    )
+                    resp.raise_for_status()
+                    sdata = resp.json()
+                user = sdata.get("user", {})
+                result["title"] = f"X post by {user.get('name', 'unknown')} (@{user.get('screen_name', '')})"
+                result["content"] = sdata.get("text", "")
+            except Exception as e2:
+                result["error"] = str(e2)
+                result["content"] = f"[Failed to fetch tweet: {e2}]"
+        return result
+
+    video_types = ("instagram", "tiktok", "youtube")
+    if source_type in video_types:
+        result["title"] = f"{source_type.title()} video"
+        video_data = await transcribe_video(url)
+        parts = []
+        if video_data.get("caption"):
+            parts.append(f"**Caption:** {video_data['caption']}")
+        if video_data.get("transcript"):
+            parts.append(f"**Transcript:** {video_data['transcript']}")
+        if parts:
+            result["content"] = "\n\n".join(parts)
+        else:
+            result["content"] = f"[Open link to view]({url})"
         return result
 
     try:
@@ -167,13 +356,6 @@ async def fetch_and_extract(url: str) -> dict:
                 content = content[:1500] + "\n\n[...truncated]"
         result["content"] = content.strip()
 
-        # Twitter: try meta tags
-        if source_type == "twitter":
-            soup_full = BeautifulSoup(html, "lxml")
-            og_desc = soup_full.find("meta", property="og:description")
-            if og_desc and og_desc.get("content"):
-                result["content"] = og_desc["content"]
-                result["title"] = "X post"
 
     except Exception as e:
         result["error"] = str(e)
@@ -182,7 +364,7 @@ async def fetch_and_extract(url: str) -> dict:
     return result
 
 
-async def summarize_with_claude(content: str, url: str) -> str | None:
+async def summarize_with_claude(content: str, url: str) -> Optional[str]:
     """Optional: summarize using Claude API."""
     if not CLAUDE_API_KEY:
         return None
@@ -202,9 +384,10 @@ async def summarize_with_claude(content: str, url: str) -> str | None:
                         {
                             "role": "user",
                             "content": (
-                                f"Summarize this in 2-3 sentences. Be specific about what's being built or claimed. "
-                                f"Focus on: what is it, who's building it, why it matters.\n\n"
-                                f"Source: {url}\n\n{content[:3000]}"
+                                f"Summarize the following text in 2-3 sentences. Be specific about what's being built or claimed. "
+                                f"Focus on: what is it, who's building it, why it matters. "
+                                f"Do NOT say you cannot access links — the text content has already been extracted for you below.\n\n"
+                                f"{content[:3000]}"
                             ),
                         }
                     ],
@@ -220,8 +403,8 @@ async def summarize_with_claude(content: str, url: str) -> str | None:
 
 def format_entry(
     text: str = "",
-    urls: list[dict] | None = None,
-    summary: str | None = None,
+    urls: Optional[List[Dict]] = None,
+    summary: Optional[str] = None,
     sender: str = "",
 ) -> str:
     """Format a single capture entry as markdown."""
@@ -294,7 +477,7 @@ def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-def get_topic_name(update: Update) -> str | None:
+def get_topic_name(update: Update) -> Optional[str]:
     """
     Extract the forum topic name from a message.
 
@@ -399,10 +582,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tasks = [fetch_and_extract(url) for url in found_urls[:5]]
         url_results = await asyncio.gather(*tasks)
 
-        # Claude summary for first link
-        if url_results and url_results[0].get("content") and CLAUDE_API_KEY:
+        # Claude summary for first link (skip if content is just a view link)
+        first = url_results[0] if url_results else None
+        if first and first.get("content") and not first["content"].startswith("[Open link") and CLAUDE_API_KEY:
             summary = await summarize_with_claude(
-                url_results[0]["content"], url_results[0]["url"]
+                first["content"], first["url"]
             )
 
     # Format and save
