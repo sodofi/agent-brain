@@ -377,7 +377,7 @@ async def summarize_with_claude(content: str, url: str) -> Optional[str]:
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "anthropic/claude-haiku-4-5-20251001",
+                    "model": "anthropic/claude-3.5-haiku",
                     "max_tokens": 300,
                     "messages": [
                         {
@@ -392,6 +392,11 @@ async def summarize_with_claude(content: str, url: str) -> Optional[str]:
                     ],
                 },
             )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+            if resp.status_code != 200:
+                log.warning(f"Summarization API error: {resp.status_code} {resp.text}")
             resp.raise_for_status()
             data = resp.json()
             return data["choices"][0]["message"]["content"]
