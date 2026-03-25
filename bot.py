@@ -52,7 +52,7 @@ try:
         TOPIC_TO_FILE,
         DEFAULT_FILE,
         ALLOWED_USER_IDS,
-        CLAUDE_API_KEY,
+        OPENROUTER_API_KEY,
     )
 except ImportError:
     print("Missing config.py — copy config.example.py to config.py and fill in your values.")
@@ -366,19 +366,18 @@ async def fetch_and_extract(url: str) -> dict:
 
 async def summarize_with_claude(content: str, url: str) -> Optional[str]:
     """Optional: summarize using Claude API."""
-    if not CLAUDE_API_KEY:
+    if not OPENROUTER_API_KEY:
         return None
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://openrouter.ai/api/v1/chat/completions",
                 headers={
-                    "x-api-key": CLAUDE_API_KEY,
-                    "anthropic-version": "2023-06-01",
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-haiku-4-5-20251001",
+                    "model": "anthropic/claude-haiku-4-5-20251001",
                     "max_tokens": 300,
                     "messages": [
                         {
@@ -395,9 +394,9 @@ async def summarize_with_claude(content: str, url: str) -> Optional[str]:
             )
             resp.raise_for_status()
             data = resp.json()
-            return data["content"][0]["text"]
+            return data["choices"][0]["message"]["content"]
     except Exception as e:
-        log.warning(f"Claude summarization failed: {e}")
+        log.warning(f"Summarization failed: {e}")
         return None
 
 
@@ -584,7 +583,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Claude summary for first link (skip if content is just a view link)
         first = url_results[0] if url_results else None
-        if first and first.get("content") and not first["content"].startswith("[Open link") and CLAUDE_API_KEY:
+        if first and first.get("content") and not first["content"].startswith("[Open link") and OPENROUTER_API_KEY:
             summary = await summarize_with_claude(
                 first["content"], first["url"]
             )
@@ -609,6 +608,92 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle .md file uploads — save to storage/ and append summary + Obsidian link to topic file."""
+    if not update.message or not update.message.document:
+        return
+    if not is_allowed(update.effective_user.id):
+        return
+
+    doc = update.message.document
+    filename = doc.file_name or ""
+    if not filename.lower().endswith(".md"):
+        return
+
+    # Download the file
+    tg_file = await doc.get_file()
+    file_bytes = await tg_file.download_as_bytearray()
+    md_content = file_bytes.decode("utf-8", errors="replace").strip()
+
+    if not md_content:
+        await update.message.reply_text("File was empty.")
+        return
+
+    # Save full file to BRAIN/storage/
+    storage_dir = Path(OBSIDIAN_VAULT_PATH) / "storage"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    storage_path = storage_dir / filename
+    if storage_path.exists():
+        # Handle name collision by appending timestamp
+        stem = storage_path.stem
+        suffix = storage_path.suffix
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"{stem}_{ts}{suffix}"
+        storage_path = storage_dir / filename
+
+    storage_path.write_text(md_content, encoding="utf-8")
+    log.info(f"Saved file to {storage_path}")
+
+    # Figure out which topic this came from
+    topic_name = get_topic_name(update)
+    thread_id = update.message.message_thread_id
+    if not topic_name and thread_id:
+        thread_map = getattr(__import__("config"), "TOPIC_THREAD_IDS", {})
+        topic_name = thread_map.get(thread_id)
+
+    target_file = get_file_for_topic(topic_name)
+
+    log.info(
+        f".md file '{filename}' from {update.effective_user.first_name} "
+        f"in topic '{topic_name or 'General'}' → {target_file.name}"
+    )
+
+    # Summarize the content
+    summary = None
+    if OPENROUTER_API_KEY:
+        summary = await summarize_with_claude(md_content, filename)
+
+    # Format entry with summary + Obsidian link
+    caption = update.message.caption or ""
+    sender = update.effective_user.first_name or ""
+
+    now = datetime.now()
+    lines = []
+    lines.append(f"## {now.strftime('%Y-%m-%d')} at {now.strftime('%H:%M')}")
+    if sender:
+        lines.append(f"*From: {sender}*")
+    lines.append("")
+    lines.append("#document")
+    lines.append("")
+    if caption:
+        lines.append(f"> {caption}")
+        lines.append("")
+    if summary:
+        lines.append(f"**Summary:** {summary}")
+        lines.append("")
+    lines.append(f"**File:** [[storage/{filename}]]")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    entry = "\n".join(lines)
+    append_to_file(target_file, entry)
+
+    file_label = target_file.stem.replace("-", " ").title()
+    await update.message.reply_text(f"→ {file_label}: 📄 {filename} saved to storage/")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -616,7 +701,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     log.info(f"Vault path: {OBSIDIAN_VAULT_PATH}")
     log.info(f"Topic routing: {TOPIC_TO_FILE}")
-    log.info(f"Claude API: {'configured' if CLAUDE_API_KEY else 'off'}")
+    log.info(f"Claude API: {'configured' if OPENROUTER_API_KEY else 'off'}")
 
     vault = Path(OBSIDIAN_VAULT_PATH)
     if not vault.exists():
@@ -634,6 +719,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     log.info("Bot is running. Send messages to your group topics.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

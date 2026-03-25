@@ -48,10 +48,10 @@ TOPIC_THREAD_IDS = {}
 ALLOWED_USER_IDS = []
 
 # ---------------------------------------------------------------------------
-# Optional: Claude API for smarter summaries
+# Optional: OpenRouter API for smarter summaries
 # ---------------------------------------------------------------------------
 
 # If set, links get a 2-3 sentence AI summary in addition to raw content.
 # Leave empty string for raw extraction only (still useful, just no summary).
-# Get a key at: https://console.anthropic.com/
-CLAUDE_API_KEY = ""
+# Get a key at: https://openrouter.ai/keys
+OPENROUTER_API_KEY = ""
