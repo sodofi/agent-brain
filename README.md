@@ -2,14 +2,7 @@
 
 A Telegram bot that routes messages from group chat topics into separate Obsidian files.
 
-```
-Telegram group "Brain"
-├── AI TRENDS  →  BRAIN/ai-trends.md
-├── CONTENT    →  BRAIN/content.md
-└── (other)    →  BRAIN/inbox.md
-```
-
-Links get fetched and content extracted. Text gets saved as-is. Everything is timestamped.
+Download a full PDF setup guide [here](https://sophiacode.gumroad.com/l/glpsbw).
 
 ## Setup
 
