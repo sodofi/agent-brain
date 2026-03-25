@@ -45,15 +45,28 @@ pip install -r requirements.txt
 python bot.py
 ```
 
+### 6. (Optional) Enable AI summaries
+
+Get an API key from [OpenRouter](https://openrouter.ai/keys) and add it to `config.py`:
+
+```python
+OPENROUTER_API_KEY = "sk-or-..."
+```
+
+When set, links and `.md` file uploads get a 2-3 sentence AI summary (powered by Claude). Leave it as an empty string to skip summaries.
+
 ## Usage
 
 Just send messages to your group topics as normal:
 
 - **Plain text** in AI TRENDS → saved to `BRAIN/ai-trends.md`
 - **A link** in CONTENT → fetched, extracted, saved to `BRAIN/content.md`
+- **A `.md` file** in any topic → full file saved to `BRAIN/storage/`, summary + Obsidian link added to the topic file
 - **`/debug`** in any topic → shows routing info
 
 The bot replies with a confirmation showing where it saved and what it extracted.
+
+Non-`.md` file uploads are silently ignored.
 
 ## Adding more topics
 
