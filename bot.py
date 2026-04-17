@@ -1,10 +1,8 @@
 """
 Obsidian Brain Bot — routes Telegram group chat topics to Obsidian files.
 
-Messages in "AI TRENDS" → BRAIN/ai-trends.md
-Messages in "CONTENT"   → BRAIN/content.md
-
-Links get fetched and content extracted. Text gets saved as-is.
+Messages go into raw/ (unprocessed). The bot also updates wiki/ with
+organized summaries after each new entry.
 
 Setup:
 1. Talk to @BotFather on Telegram, create a bot, grab the token
@@ -58,6 +56,9 @@ except ImportError:
     print("Missing config.py — copy config.example.py to config.py and fill in your values.")
     raise SystemExit(1)
 
+# Import thread ID mapping
+from config import TOPIC_THREAD_IDS
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -87,14 +88,51 @@ HEADERS = {
 # Build a lookup from lowercased topic name → file path
 _TOPIC_LOOKUP: Dict[str, str] = {k.lower(): v for k, v in TOPIC_TO_FILE.items()}
 
+# Build reverse lookup: thread_id → topic name (authoritative, survives renames)
+_THREAD_TO_TOPIC: Dict[int, str] = dict(TOPIC_THREAD_IDS)
+
+
+def resolve_topic_name(update: Update) -> Optional[str]:
+    """
+    Resolve the current topic name for a message.
+
+    Priority:
+    1. TOPIC_THREAD_IDS mapping (most reliable — survives topic renames)
+    2. forum_topic_created from Telegram (can be stale after renames)
+    """
+    msg = update.message
+    if not msg:
+        return None
+
+    thread_id = msg.message_thread_id
+    if thread_id and thread_id in _THREAD_TO_TOPIC:
+        return _THREAD_TO_TOPIC[thread_id]
+
+    # Fallback: Telegram's forum_topic_created (may show old name after rename)
+    if msg.forum_topic_created:
+        return msg.forum_topic_created.name
+    if msg.reply_to_message and msg.reply_to_message.forum_topic_created:
+        return msg.reply_to_message.forum_topic_created.name
+
+    return None
+
 
 def get_file_for_topic(topic_name: Optional[str]) -> Path:
-    """Given a forum topic name, return the Obsidian file path."""
+    """Given a forum topic name, return the Obsidian file path (inside raw/)."""
     if topic_name:
         match = _TOPIC_LOOKUP.get(topic_name.strip().lower())
         if match:
-            return Path(OBSIDIAN_VAULT_PATH) / match
-    return Path(OBSIDIAN_VAULT_PATH) / DEFAULT_FILE
+            return Path(OBSIDIAN_VAULT_PATH) / "raw" / match
+    return Path(OBSIDIAN_VAULT_PATH) / "raw" / DEFAULT_FILE
+
+
+def get_wiki_path_for_topic(topic_name: Optional[str]) -> Path:
+    """Given a topic name, return the corresponding wiki file path."""
+    if topic_name:
+        match = _TOPIC_LOOKUP.get(topic_name.strip().lower())
+        if match:
+            return Path(OBSIDIAN_VAULT_PATH) / "wiki" / match
+    return Path(OBSIDIAN_VAULT_PATH) / "wiki" / DEFAULT_FILE
 
 
 def ensure_file(path: Path) -> Path:
@@ -103,6 +141,20 @@ def ensure_file(path: Path) -> Path:
     if not path.exists():
         name = path.stem.replace("-", " ").title()
         path.write_text(f"# {name}\n\nAuto-populated from Telegram.\n\n---\n\n")
+    return path
+
+
+def ensure_wiki_file(path: Path, topic_name: str) -> Path:
+    """Create a wiki file with a header if it doesn't exist."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        name = path.stem.replace("-", " ").title()
+        path.write_text(
+            f"# {name}\n\n"
+            f"Organized wiki for **{topic_name}**. "
+            f"Auto-maintained by the Brain Bot from [[raw/{path.name}]].\n\n"
+            f"---\n\n"
+        )
     return path
 
 
@@ -365,7 +417,7 @@ async def fetch_and_extract(url: str) -> dict:
 
 
 async def summarize_with_claude(content: str, url: str) -> Optional[str]:
-    """Optional: summarize using Claude API."""
+    """Summarize content using Claude via OpenRouter."""
     if not OPENROUTER_API_KEY:
         return None
     try:
@@ -395,14 +447,89 @@ async def summarize_with_claude(content: str, url: str) -> Optional[str]:
             resp.raise_for_status()
             data = resp.json()
             return data["choices"][0]["message"]["content"]
-            if resp.status_code != 200:
-                log.warning(f"Summarization API error: {resp.status_code} {resp.text}")
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
     except Exception as e:
         log.warning(f"Summarization failed: {e}")
         return None
+
+
+async def update_wiki(topic_name: str, new_entry: str):
+    """
+    Update the wiki file for a topic after new content is added to raw/.
+    Uses Claude to integrate the new entry into the organized wiki.
+    """
+    if not OPENROUTER_API_KEY:
+        log.info("Skipping wiki update (no API key)")
+        return
+
+    wiki_path = get_wiki_path_for_topic(topic_name)
+    ensure_wiki_file(wiki_path, topic_name or "Inbox")
+
+    existing_wiki = wiki_path.read_text()
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "anthropic/claude-3.5-haiku",
+                    "max_tokens": 2000,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                f"You maintain an organized wiki file for a personal knowledge base.\n\n"
+                                f"Topic: {topic_name or 'Inbox'}\n\n"
+                                f"CURRENT WIKI CONTENT:\n```\n{existing_wiki[-3000:]}\n```\n\n"
+                                f"NEW RAW ENTRY JUST ADDED:\n```\n{new_entry[:2000]}\n```\n\n"
+                                f"Update the wiki by integrating the new entry. Rules:\n"
+                                f"- Keep the existing # heading and intro paragraph\n"
+                                f"- Organize by theme/concept, NOT by date\n"
+                                f"- Each theme gets a ## subheading\n"
+                                f"- Summarize and connect ideas — don't just copy the raw text\n"
+                                f"- Use [[topic-name]] links to reference related wiki pages when relevant\n"
+                                f"- Keep it concise — this is a reference wiki, not a journal\n"
+                                f"- Return the FULL updated wiki file content (not just the diff)\n"
+                                f"- Do NOT wrap in code blocks — return raw markdown only"
+                            ),
+                        }
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            updated_wiki = data["choices"][0]["message"]["content"].strip()
+
+            # Sanity check: don't write empty or tiny responses
+            if len(updated_wiki) > 50:
+                wiki_path.write_text(updated_wiki + "\n")
+                log.info(f"Wiki updated: {wiki_path.name}")
+            else:
+                log.warning(f"Wiki update too short, skipping: {len(updated_wiki)} chars")
+
+    except Exception as e:
+        log.warning(f"Wiki update failed for {topic_name}: {e}")
+
+
+async def update_wiki_index():
+    """Update the wiki INDEX.md with a list of all wiki files."""
+    wiki_dir = Path(OBSIDIAN_VAULT_PATH) / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    index_path = wiki_dir / "INDEX.md"
+
+    lines = ["# Wiki Index\n", "All organized topics in this knowledge base.\n", "---\n"]
+
+    for f in sorted(wiki_dir.glob("*.md")):
+        if f.name == "INDEX.md":
+            continue
+        name = f.stem.replace("-", " ").title()
+        lines.append(f"- [[wiki/{f.name}|{name}]]")
+
+    lines.append("")
+    index_path.write_text("\n".join(lines))
 
 
 def format_entry(
@@ -481,32 +608,6 @@ def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-def get_topic_name(update: Update) -> Optional[str]:
-    """
-    Extract the forum topic name from a message.
-
-    Telegram forum topics use message_thread_id. The topic name comes from
-    the reply_to_message's forum_topic_created field when it's the pinned
-    service message, but more reliably we can get it from the chat's
-    get_forum_topic method or from the thread's name field.
-
-    As a fallback, we map thread IDs via config.
-    """
-    msg = update.message
-    if not msg:
-        return None
-
-    # Check if the message itself is a forum topic creation
-    if msg.forum_topic_created:
-        return msg.forum_topic_created.name
-
-    # Check reply_to_message for the topic header
-    if msg.reply_to_message and msg.reply_to_message.forum_topic_created:
-        return msg.reply_to_message.forum_topic_created.name
-
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Bot handlers
 # ---------------------------------------------------------------------------
@@ -517,36 +618,54 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         "Brain bot is running.\n\n"
-        "Send messages to the group topics and they'll land in your Obsidian vault:\n"
+        "Messages go to raw/ then get organized into wiki/.\n\n"
+        "Topic routing:\n"
     )
     for topic, filepath in TOPIC_TO_FILE.items():
-        msg += f"  • {topic} → {filepath}\n"
+        msg += f"  \u2022 {topic} \u2192 raw/{filepath}\n"
     msg += f"\nYour user ID: {update.effective_user.id}"
 
     await update.message.reply_text(msg)
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Debug command — shows thread info so you can map topic IDs."""
+    """Debug command — shows thread ID for mapping topics."""
     if not is_allowed(update.effective_user.id):
         return
 
     msg = update.message
     thread_id = msg.message_thread_id if msg.message_thread_id else "None"
-    topic_name = get_topic_name(update) or "Unknown"
-    target_file = get_file_for_topic(topic_name)
 
-    await update.message.reply_text(
-        f"Thread ID: {thread_id}\n"
-        f"Topic name: {topic_name}\n"
-        f"Target file: {target_file.relative_to(OBSIDIAN_VAULT_PATH)}\n"
-        f"Chat ID: {msg.chat_id}\n"
-        f"Chat type: {msg.chat.type}"
-    )
+    # Show what this thread ID currently maps to in config
+    config_mapping = _THREAD_TO_TOPIC.get(msg.message_thread_id, "NOT MAPPED")
+
+    # Show the (potentially stale) Telegram name for reference
+    tg_name = None
+    if msg.forum_topic_created:
+        tg_name = msg.forum_topic_created.name
+    elif msg.reply_to_message and msg.reply_to_message.forum_topic_created:
+        tg_name = msg.reply_to_message.forum_topic_created.name
+
+    lines = [
+        f"\U0001f50d Thread ID: {thread_id}",
+        f"\U0001f4cb Config mapping: {config_mapping}",
+    ]
+    if tg_name and tg_name != config_mapping:
+        lines.append(f"\u26a0\ufe0f Telegram name (may be stale): {tg_name}")
+    lines.append(f"\U0001f4ac Chat ID: {msg.chat_id}")
+    lines.append(f"\U0001f464 Your user ID: {update.effective_user.id}")
+
+    if config_mapping == "NOT MAPPED":
+        lines.append(
+            f"\n\u2757 Add this to TOPIC_THREAD_IDS in config.py:\n"
+            f"    {thread_id}: \"YOUR_TOPIC_NAME\","
+        )
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle any message — route to the right Obsidian file based on topic."""
+    """Handle any message — route to raw/ file based on topic, then update wiki."""
     if not update.message:
         return
     if not is_allowed(update.effective_user.id):
@@ -556,24 +675,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text.strip():
         return
 
-    # Figure out which topic this came from
-    topic_name = get_topic_name(update)
-
-    # Also try to detect topic from thread_id + topic name mapping
-    # Telegram sometimes only gives us the thread_id, not the name.
-    # After the first /debug in each topic, you can add thread_id mappings
-    # to TOPIC_THREAD_IDS in config if needed.
-    thread_id = update.message.message_thread_id
-    if not topic_name and thread_id:
-        # Check if there's a thread ID mapping in config
-        thread_map = getattr(__import__("config"), "TOPIC_THREAD_IDS", {})
-        topic_name = thread_map.get(thread_id)
-
+    # Resolve topic (thread ID mapping takes priority)
+    topic_name = resolve_topic_name(update)
     target_file = get_file_for_topic(topic_name)
 
     log.info(
         f"Message from {update.effective_user.first_name} "
-        f"in topic '{topic_name or 'General'}' → {target_file.name}"
+        f"in topic '{topic_name or 'General'}' \u2192 {target_file.relative_to(OBSIDIAN_VAULT_PATH)}"
     )
 
     # Find URLs
@@ -586,35 +694,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tasks = [fetch_and_extract(url) for url in found_urls[:5]]
         url_results = await asyncio.gather(*tasks)
 
-        # Claude summary for first link (skip if content is just a view link)
+        # Claude summary for first link
         first = url_results[0] if url_results else None
         if first and first.get("content") and not first["content"].startswith("[Open link") and OPENROUTER_API_KEY:
             summary = await summarize_with_claude(
                 first["content"], first["url"]
             )
 
-    # Format and save
+    # Format and save to raw/
     sender = update.effective_user.first_name or ""
     entry = format_entry(text=text, urls=url_results or None, summary=summary, sender=sender)
     append_to_file(target_file, entry)
+
+    # Update wiki (non-blocking — don't make the user wait)
+    asyncio.create_task(update_wiki(topic_name, entry))
+    asyncio.create_task(update_wiki_index())
 
     # Confirm
     file_label = target_file.stem.replace("-", " ").title()
     if url_results:
         titles = [u.get("title", u["source_type"]) for u in url_results]
         label = ", ".join(t[:40] for t in titles if t)
-        reply = f"→ {file_label}: {label}" if label else f"→ {file_label}"
+        reply = f"\u2192 raw/{target_file.name}: {label}" if label else f"\u2192 raw/{target_file.name}"
         if any(u.get("error") for u in url_results):
             reply += " (some links failed)"
     else:
         preview = text[:50] + "..." if len(text) > 50 else text
-        reply = f"→ {file_label}: {preview}"
+        reply = f"\u2192 raw/{target_file.name}: {preview}"
 
+    reply += "\n\U0001f4da wiki updated"
     await update.message.reply_text(reply)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle .md file uploads — save to storage/ and append summary + Obsidian link to topic file."""
+    """Handle .md file uploads — save to raw/storage/ and append to topic file."""
     if not update.message or not update.message.document:
         return
     if not is_allowed(update.effective_user.id):
@@ -634,13 +747,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("File was empty.")
         return
 
-    # Save full file to BRAIN/storage/
-    storage_dir = Path(OBSIDIAN_VAULT_PATH) / "storage"
+    # Save full file to raw/storage/
+    storage_dir = Path(OBSIDIAN_VAULT_PATH) / "raw" / "storage"
     storage_dir.mkdir(parents=True, exist_ok=True)
 
     storage_path = storage_dir / filename
     if storage_path.exists():
-        # Handle name collision by appending timestamp
         stem = storage_path.stem
         suffix = storage_path.suffix
         ts = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -650,18 +762,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     storage_path.write_text(md_content, encoding="utf-8")
     log.info(f"Saved file to {storage_path}")
 
-    # Figure out which topic this came from
-    topic_name = get_topic_name(update)
-    thread_id = update.message.message_thread_id
-    if not topic_name and thread_id:
-        thread_map = getattr(__import__("config"), "TOPIC_THREAD_IDS", {})
-        topic_name = thread_map.get(thread_id)
-
+    # Resolve topic
+    topic_name = resolve_topic_name(update)
     target_file = get_file_for_topic(topic_name)
 
     log.info(
         f".md file '{filename}' from {update.effective_user.first_name} "
-        f"in topic '{topic_name or 'General'}' → {target_file.name}"
+        f"in topic '{topic_name or 'General'}' \u2192 {target_file.relative_to(OBSIDIAN_VAULT_PATH)}"
     )
 
     # Summarize the content
@@ -687,7 +794,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if summary:
         lines.append(f"**Summary:** {summary}")
         lines.append("")
-    lines.append(f"**File:** [[storage/{filename}]]")
+    lines.append(f"**File:** [[raw/storage/{filename}]]")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -695,8 +802,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry = "\n".join(lines)
     append_to_file(target_file, entry)
 
+    # Update wiki
+    asyncio.create_task(update_wiki(topic_name, entry))
+    asyncio.create_task(update_wiki_index())
+
     file_label = target_file.stem.replace("-", " ").title()
-    await update.message.reply_text(f"→ {file_label}: 📄 {filename} saved to storage/")
+    await update.message.reply_text(f"\u2192 raw/{target_file.name}: \U0001f4c4 {filename} saved\n\U0001f4da wiki updated")
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +817,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     log.info(f"Vault path: {OBSIDIAN_VAULT_PATH}")
     log.info(f"Topic routing: {TOPIC_TO_FILE}")
+    log.info(f"Thread ID mapping: {TOPIC_THREAD_IDS}")
     log.info(f"Claude API: {'configured' if OPENROUTER_API_KEY else 'off'}")
 
     vault = Path(OBSIDIAN_VAULT_PATH)
@@ -713,10 +825,15 @@ def main():
         log.error(f"Vault path does not exist: {OBSIDIAN_VAULT_PATH}")
         raise SystemExit(1)
 
-    # Ensure all target files exist
+    # Ensure directories exist
+    (vault / "raw").mkdir(exist_ok=True)
+    (vault / "wiki").mkdir(exist_ok=True)
+    (vault / "outputs").mkdir(exist_ok=True)
+
+    # Ensure all target files exist in raw/
     for filepath in TOPIC_TO_FILE.values():
-        ensure_file(vault / filepath)
-    ensure_file(vault / DEFAULT_FILE)
+        ensure_file(vault / "raw" / filepath)
+    ensure_file(vault / "raw" / DEFAULT_FILE)
     log.info("All target files verified.")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
