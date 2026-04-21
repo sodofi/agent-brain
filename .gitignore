@@ -1,6 +1,11 @@
 # Private config (contains bot token, API keys, vault path)
 config.py
 
+# Bot implementation (build your own with Claude Code)
+bot.py
+compile_wiki.py
+setup-vps.sh
+
 # Python
 __pycache__/
 *.pyc
@@ -10,6 +15,10 @@ __pycache__/
 .env
 venv/
 .venv/
+.claude/
+
+# Dependencies (users install their own)
+requirements.txt
 
 # OS
 .DS_Store
