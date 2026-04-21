@@ -2,6 +2,12 @@
 
 A Telegram bot that routes messages from group chat topics into separate Obsidian files.
 
+
+
+https://github.com/user-attachments/assets/4319b4f5-9093-48b2-b3ae-c3cb3795f70f
+
+
+
 [Download the complete PDF setup guide](https://sophiacode.gumroad.com/l/glpsbw).
 
 ## Setup
